@@ -1,0 +1,191 @@
+import os
+import time
+import hashlib
+import math
+import base64
+import threading
+import re
+import requests
+import telebot
+from telebot import types
+from dotenv import load_dotenv
+
+# --- تحميل الإعدادات من ملف .env ---
+load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+# التحقق من وجود البيانات
+if not all([TELEGRAM_BOT_TOKEN, VIRUSTOTAL_API_KEY, ADMIN_ID]):
+    print("❌ خطأ: تأكد من إعداد ملف .env بشكل صحيح!")
+    exit()
+
+ADMIN_ID = int(ADMIN_ID)
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# --- الثوابت ---
+VT_BASE_URL = "https://www.virustotal.com/api/v3"
+HEADERS = {"x-apikey": VIRUSTOTAL_API_KEY}
+URL_REGEX = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+')
+
+# مخزن مؤقت (Cache)
+result_cache = {}
+
+# -----------------------
+# الدوال المساعدة
+# -----------------------
+
+def is_admin(message):
+    return message.from_user.id == ADMIN_ID
+
+def calculate_entropy(data):
+    """تحليل العشوائية لاكتشاف الملفات المشفرة أو المخفية."""
+    if not data: return 0
+    entropy = 0
+    for x in range(256):
+        p_x = float(data.count(x))/len(data)
+        if p_x > 0:
+            entropy += - p_x * math.log(p_x, 2)
+    return entropy
+
+def get_score_bar(malicious, total):
+    """رسم شريط الخطورة الملون."""
+    if total == 0: return "⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜"
+    percentage = (malicious / total) * 10
+    filled = max(1, int(percentage)) if malicious > 0 else 0
+    empty = 10 - filled
+    if malicious == 0: return "🟩" * 10
+    if malicious < 5: return "🟧" * filled + "⬜" * empty
+    return "🟥" * filled + "⬜" * empty
+
+def format_final_report(data, h_note):
+    """تنسيق التقرير النهائي بشكل جمالي."""
+    attr = data['attributes']
+    stats = attr['last_analysis_stats']
+    mal = stats.get('malicious', 0)
+    total = sum(stats.values())
+    
+    if mal >= 5:
+        status_emoji, status_text = "☣️", "DANGEROUS / خبيث"
+    elif mal > 0:
+        status_emoji, status_text = "⚠️", "SUSPICIOUS / مشبوه"
+    else:
+        status_emoji, status_text = "✅", "CLEAN / آمن"
+
+    score_bar = get_score_bar(mal, total)
+    
+    report = (
+        f"{status_emoji} **SECURITY ANALYSIS REPORT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 **Status:** `{status_text}`\n"
+        f"📊 **Risk Score:** [{score_bar}] `{mal}/{total}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔍 **Detection Details:**\n"
+        f"  ├ 🦠 Malicious: `{mal}`\n"
+        f"  ├ ⚠️ Suspicious: `{stats.get('suspicious', 0)}`\n"
+        f"  ├ 🛡️ Harmless: `{stats.get('harmless', 0)}`\n"
+        f"  └ ❓ Undetected: `{stats.get('undetected', 0)}`\n\n"
+        f"🧠 **Heuristic Analysis:**\n"
+        f"  └ `{h_note}`\n\n"
+        f"👥 **Community Verdict:**\n"
+        f"  └ 👎 `{attr.get('total_votes', {}).get('malicious', 0)}` | 👍 `{attr.get('total_votes', {}).get('harmless', 0)}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 **Date:** `{time.strftime('%Y-%m-%d %H:%M')}`\n"
+        f"🆔 **ID:** `{data['id'][:20]}...`"
+    )
+    return report
+
+def create_vt_button(r_id, r_type):
+    markup = types.InlineKeyboardMarkup()
+    url = f"https://www.virustotal.com/gui/{r_type}/{r_id}"
+    markup.add(types.InlineKeyboardButton("🌐 View Online Report", url=url))
+    return markup
+
+# -----------------------
+# محرك المعالجة المتوازية (Threading)
+# -----------------------
+
+def poll_analysis(analysis_id):
+    for _ in range(15):
+        time.sleep(15)
+        res = requests.get(f"{VT_BASE_URL}/analyses/{analysis_id}", headers=HEADERS)
+        if res.status_code == 200:
+            status = res.json()['data']['attributes']['status']
+            if status == "completed":
+                meta = res.json()['meta']
+                return True, meta['file_info']['sha256'] if 'file_info' in meta else meta['url_info']['id']
+    return False, None
+
+def process_file_thread(chat_id, message_id, file_content, file_name):
+    f_hash = hashlib.sha256(file_content).hexdigest()
+    
+    if f_hash in result_cache:
+        bot.edit_message_text(f"♻️ **RESULT FROM CACHE**\n\n{result_cache[f_hash]}", 
+                             chat_id, message_id, parse_mode='Markdown')
+        return
+
+    entropy = calculate_entropy(file_content)
+    h_note = "⚠️ High Entropy (Encrypted?)" if entropy > 7.2 else "✅ Normal Structure"
+
+    res = requests.get(f"{VT_BASE_URL}/files/{f_hash}", headers=HEADERS)
+    if res.status_code == 200:
+        report = format_final_report(res.json()['data'], h_note)
+        result_cache[f_hash] = report
+        bot.edit_message_text(report, chat_id, message_id, parse_mode='Markdown', 
+                             reply_markup=create_vt_button(f_hash, "file"))
+    else:
+        bot.edit_message_text("🆕 **New File!**\n📤 Uploading to Sandbox...", chat_id, message_id)
+        files = {'file': (file_name, file_content)}
+        upload = requests.post(f"{VT_BASE_URL}/files", headers=HEADERS, files=files)
+        if upload.status_code == 200:
+            success, final_id = poll_analysis(upload.json()['data']['id'])
+            if success:
+                data = requests.get(f"{VT_BASE_URL}/files/{final_id}", headers=HEADERS).json()['data']
+                report = format_final_report(data, h_note)
+                bot.edit_message_text(report, chat_id, message_id, parse_mode='Markdown', 
+                                     reply_markup=create_vt_button(final_id, "file"))
+
+# -----------------------
+# المعالجات (Handlers)
+# -----------------------
+
+@bot.message_handler(func=lambda m: not is_admin(m))
+def access_denied(message):
+    bot.reply_to(message, "🚫 **Access Denied**\nهذا البوت خاص بصاحبه فقط.")
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "👑 **أهلاً بك سيدي القائد!**\nالنظام متصل وجاهز للفحص. أرسل ملفاً أو رابطاً الآن.")
+
+@bot.message_handler(content_types=['document'])
+def handle_docs(message):
+    if message.document.file_size > 32 * 1024 * 1024:
+        return bot.reply_to(message, "❌ **خطأ بالحجم:** الملف أكبر من 32 ميجابايت.")
+    
+    msg = bot.reply_to(message, "📥 **تم الاستلام.** جاري الفحص في الخلفية...")
+    file_info = bot.get_file(message.document.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    
+    threading.Thread(target=process_file_thread, args=(message.chat.id, msg.message_id, downloaded, message.document.file_name)).start()
+
+@bot.message_handler(func=lambda m: URL_REGEX.match(m.text))
+def handle_url(message):
+    status_msg = bot.reply_to(message, "📡 **جاري فحص الرابط...**")
+    url = message.text.strip()
+    
+    def url_thread():
+        url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+        res = requests.get(f"{VT_BASE_URL}/urls/{url_id}", headers=HEADERS)
+        if res.status_code == 200:
+            report = format_final_report(res.json()['data'], "External Link")
+            bot.edit_message_text(report, message.chat.id, status_msg.message_id, parse_mode='Markdown', 
+                                 reply_markup=create_vt_button(url_id, "url"))
+        else:
+            bot.edit_message_text("🔄 **رابط جديد.** جاري التحليل...", message.chat.id, status_msg.message_id)
+            requests.post(f"{VT_BASE_URL}/urls", headers=HEADERS, data={'url': url})
+    
+    threading.Thread(target=url_thread).start()
+
+print("🚀 Security Bot is running with Admin Lock and .env protection...")
+bot.infinity_polling()
