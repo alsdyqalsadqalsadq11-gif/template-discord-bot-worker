@@ -1,0 +1,374 @@
+import os
+import asyncio
+import logging
+import json
+import io
+import secrets
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+
+# --- [ 📊 إعداد نظام المراقبة والتسجيل ] ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    handlers=[
+        logging.FileHandler("iron_vault.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("IronVault")
+
+# تحميل المتغيرات من ملف .env المخفي
+load_dotenv()
+
+# --- [ 🛠️ التحقق من البيئة والمكتبات ] ---
+try:
+    from pyrogram import Client, filters, errors
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from PIL import Image
+    # السماح بمعالجة الصور العملاقة للملفات الثقيلة
+    Image.MAX_IMAGE_PIXELS = None 
+except ImportError as e:
+    logger.critical(f"🚨 خطأ في تحميل المكتبات: {e}")
+    print("تأكد من تثبيت المكتبات: pip install pyrogram tgcrypto cryptography pillow python-dotenv")
+    sys.exit(1)
+
+# --- [ ⚙️ الإعدادات السيادية العليا ] ---
+class GlobalConfig:
+    try:
+        # جلب البيانات من ملف .env بشكل آمن
+        API_ID = int(os.getenv("API_ID", 0))  
+        API_HASH = os.getenv("API_HASH") 
+        BOT_TOKEN = os.getenv("BOT_TOKEN") 
+        OWNER_ID = int(os.getenv("OWNER_ID", 0))
+        DB_MASTER_KEY = os.getenv("DB_MASTER_KEY") # المفتاح الرئيسي الجديد لحماية قاعدة البيانات
+        
+        # التحقق من أن القيم ليست فارغة
+        if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID, DB_MASTER_KEY]):
+            raise ValueError("إحدى القيم الحساسة مفقودة (بما في ذلك DB_MASTER_KEY)!")
+            
+    except (TypeError, ValueError) as e:
+        logger.critical("🚨 إيقاف طوارئ: لم يتم العثور على المفاتيح الحساسة بشكل صحيح!")
+        print("تأكد من وضع API_ID, API_HASH, BOT_TOKEN, OWNER_ID, و DB_MASTER_KEY في ملف .env")
+        sys.exit(1)
+    
+    DB_NAME = "iron_vault_ultimate.db"
+    SESSION_NAME = "IronVault_Sovereign"
+    VERSION = "13.0-ULTIMATE-SECURE-DB"
+    START_TIME = time.time()
+
+# --- [ 🛡️ حماية قاعدة البيانات (Vault Protector) ] ---
+class VaultProtector:
+    """طبقة مسؤولة عن تشفير المفتاح الخاص قبل تخزينه في قاعدة البيانات"""
+    def __init__(self, master_password: str):
+        # استخدام أملاح ثابتة لكل بوت لضمان استقرار توليد المفتاح
+        self.salt = b"IRON_VAULT_STATIC_SALT_FOR_DB_KEY_DERIVATION"
+        
+        # توليد مفتاح AES-256 بناءً على كلمة المرور الرئيسية
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.salt,
+            iterations=480000, # عدد دورات عالي لتعقيد هجمات Brute-Force
+        )
+        self.db_key = kdf.derive(master_password.encode('utf-8'))
+        self.aesgcm = AESGCM(self.db_key)
+
+    def encrypt_private_key(self, private_key_pem: bytes) -> bytes:
+        """تشفير المفتاح الخاص قبل إرساله لـ SQLite"""
+        nonce = secrets.token_bytes(12)
+        ciphertext = self.aesgcm.encrypt(nonce, private_key_pem, None)
+        # دمج الـ Nonce مع النص المشفر
+        return nonce + ciphertext
+
+    def decrypt_private_key(self, encrypted_data: bytes) -> bytes:
+        """فك تشفير المفتاح الخاص المستخرج من SQLite"""
+        try:
+            nonce = encrypted_data[:12]
+            ciphertext = encrypted_data[12:]
+            return self.aesgcm.decrypt(nonce, ciphertext, None)
+        except Exception as e:
+            logger.error(f"فشل فك تشفير قاعدة البيانات (هل تم تغيير DB_MASTER_KEY؟): {e}")
+            raise ValueError("المفتاح الرئيسي لقاعدة البيانات غير صحيح أو البيانات تالفة.")
+
+# تهيئة حارس قاعدة البيانات
+db_protector = VaultProtector(GlobalConfig.DB_MASTER_KEY)
+
+# --- [ ⚡ محرك الأشباح المطور - GHOST ENGINE X ] ---
+class GhostEngineX:
+    @staticmethod
+    def encrypt_atomic(data: bytes, pub_key_pem: bytes, extension: str):
+        """تشفير شامل مع دمج بصمة الامتداد (APK/Large Files)"""
+        ext_bytes = extension.encode('utf-8')
+        ext_len = len(ext_bytes).to_bytes(1, 'big')
+        payload = ext_len + ext_bytes + data
+        
+        k1, k2 = secrets.token_bytes(32), secrets.token_bytes(32)
+        n1, n2 = secrets.token_bytes(12), secrets.token_bytes(12)
+
+        c1 = AESGCM(k1).encrypt(n1, payload, None)
+        c2 = ChaCha20Poly1305(k2).encrypt(n2, c1, None)
+
+        pub_key = serialization.load_pem_public_key(pub_key_pem)
+        wrapped = pub_key.encrypt(
+            k1 + k2,
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA512()), algorithm=hashes.SHA512(), label=None)
+        )
+        return len(wrapped).to_bytes(4, 'big') + wrapped + n1 + n2 + c2
+
+    @staticmethod
+    def decrypt_atomic(blob: bytes, priv_key_pem: bytes):
+        """فك التشفير واستعادة الامتداد والتوقيع الأصلي بايت-بايت"""
+        try:
+            k_len = int.from_bytes(blob[:4], 'big')
+            wrapped = blob[4:4+k_len]
+            n1 = blob[4+k_len:16+k_len]
+            n2 = blob[16+k_len:28+k_len]
+            cipher = blob[28+k_len:]
+
+            priv_key = serialization.load_pem_private_key(priv_key_pem, password=None)
+            keys = priv_key.decrypt(wrapped, padding.OAEP(mgf=padding.MGF1(hashes.SHA512()), algorithm=hashes.SHA512(), label=None))
+            
+            k1, k2 = keys[:32], keys[32:]
+            decrypted_payload = AESGCM(k1).decrypt(n1, ChaCha20Poly1305(k2).decrypt(n2, cipher, None), None)
+            
+            e_len = decrypted_payload[0]
+            ext = decrypted_payload[1:1+e_len].decode('utf-8')
+            original_data = decrypted_payload[1+e_len:]
+            return original_data, ext
+        except Exception as e:
+            logger.error(f"Decryption failure in GhostEngine: {e}")
+            raise ValueError(f"فشل فك التشفير: {str(e)}")
+
+    @staticmethod
+    def stego_hide(data: bytes):
+        """التعمية الصورية للملفات العملاقة (APK) - توزيع صامت"""
+        payload = len(data).to_bytes(8, 'big') + data
+        total_pixels = (len(payload) // 3) + 1
+        
+        width = 4096 
+        height = (total_pixels // width) + 1
+        
+        img = Image.new('RGB', (width, height))
+        padding_size = (width * height * 3) - len(payload)
+        img.frombytes(payload + b'\x00' * padding_size)
+        
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", compress_level=0)
+        return buf.getvalue()
+
+    @staticmethod
+    def stego_reveal(img_bytes: bytes):
+        """فك تعمية البكسلات واستعادة الكتلة المشفرة"""
+        img = Image.open(io.BytesIO(img_bytes))
+        raw = img.tobytes()
+        size = int.from_bytes(raw[:8], 'big')
+        return raw[8:8+size]
+
+# --- [ 🤖 واجهة التحكم والعمليات ] ---
+app = Client(
+    GlobalConfig.SESSION_NAME, 
+    api_id=GlobalConfig.API_ID, 
+    api_hash=GlobalConfig.API_HASH, 
+    bot_token=GlobalConfig.BOT_TOKEN
+)
+
+def db_setup():
+    """تهيئة قاعدة البيانات للمرة الأولى"""
+    with sqlite3.connect(GlobalConfig.DB_NAME) as conn:
+        # حقل priv الآن سيحتوي على مفتاح RSA مشفر بـ AES-GCM وليس نصاً صريحاً
+        conn.execute("CREATE TABLE IF NOT EXISTS security_core (uid INTEGER PRIMARY KEY, priv BLOB, pub BLOB)")
+    logger.info("Database setup completed successfully.")
+
+@app.on_message(filters.command("start") & filters.user(GlobalConfig.OWNER_ID))
+async def main_menu(c, m):
+    kb = ReplyKeyboardMarkup([
+        ["🔐 التشفير الكلي", "🖼️ التعمية الصورية"],
+        ["🔑 إدارة الهوية", "🛡️ حالة النظام"]
+    ], resize_keyboard=True)
+    await m.reply_text(
+        f"🛡️ **نظام IRON VAULT v{GlobalConfig.VERSION}**\n\n"
+        "مرحباً بك أيها القائد. النظام الآن محمي بطبقة تشفير داخلية لقاعدة البيانات "
+        "لضمان أقصى درجات السرية للمفاتيح الخاصة.",
+        reply_markup=kb
+    )
+
+@app.on_message(filters.regex("🛡️ حالة النظام") & filters.user(GlobalConfig.OWNER_ID))
+async def system_status(c, m):
+    """عرض إحصائيات النظام وحالة التشفير"""
+    uptime = int(time.time() - GlobalConfig.START_TIME)
+    db_size = os.path.getsize(GlobalConfig.DB_NAME) / 1024 if os.path.exists(GlobalConfig.DB_NAME) else 0
+    
+    with sqlite3.connect(GlobalConfig.DB_NAME) as conn:
+        has_keys = conn.execute("SELECT 1 FROM security_core WHERE uid=?", (m.from_user.id,)).fetchone()
+    
+    key_status = "✅ مشفرة ومؤمنة في القاعدة" if has_keys else "❌ لا يوجد مفاتيح مخصصة"
+    
+    status_msg = (
+        f"📊 **تقرير حالة النظام (IRON VAULT):**\n\n"
+        f"⏱️ **وقت التشغيل:** `{uptime} ثانية`\n"
+        f"💾 **حجم قاعدة البيانات:** `{db_size:.2f} KB`\n"
+        f"🔐 **حالة الهوية:** {key_status}\n"
+        f"🛡️ **حماية القاعدة (VaultProtector):** `نشط (AES-GCM)`\n"
+        f"⚙️ **إصدار المحرك:** `{GlobalConfig.VERSION}`"
+    )
+    await m.reply_text(status_msg)
+
+@app.on_message(filters.regex("🔑 إدارة الهوية") & filters.user(GlobalConfig.OWNER_ID))
+async def identity_manager(c, m):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 توليد RSA-4096", callback_data="id_generate")],
+        [InlineKeyboardButton("📤 تصدير الهوية (نسخة احتياطية)", callback_data="id_export")]
+    ])
+    await m.reply_text("🌐 **لوحة تحكم المفاتيح السيادية:**", reply_markup=kb)
+
+@app.on_callback_query(filters.regex("^id_") & filters.user(GlobalConfig.OWNER_ID))
+async def handle_identity(c, q):
+    action = q.data.split("_")[1]
+    
+    if action == "generate":
+        await q.answer("⏳ جاري توليد وتشفير المفاتيح العسكرية...", show_alert=False)
+        key = rsa.generate_private_key(65537, 4096)
+        
+        # 1. استخراج المفاتيح بصيغة PEM
+        raw_priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        pub = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        
+        # 2. تشفير المفتاح الخاص قبل إرساله لقاعدة البيانات
+        encrypted_priv = db_protector.encrypt_private_key(raw_priv)
+        
+        with sqlite3.connect(GlobalConfig.DB_NAME) as conn:
+            conn.execute("INSERT OR REPLACE INTO security_core VALUES (?, ?, ?)", (q.from_user.id, encrypted_priv, pub))
+            
+        logger.info(f"User {q.from_user.id} generated new encrypted RSA keys.")
+        await q.edit_message_text("✅ **تم توليد مفاتيح RSA-4096 وتشفير المفتاح الخاص بنجاح داخل قاعدة البيانات.**")
+    
+    elif action == "export":
+        with sqlite3.connect(GlobalConfig.DB_NAME) as conn:
+            row = conn.execute("SELECT priv, pub FROM security_core WHERE uid=?", (q.from_user.id,)).fetchone()
+            
+        if not row: 
+            return await q.answer("❌ لا تملك هوية رقمية حالياً لتصديرها!", show_alert=True)
+            
+        try:
+            # فك تشفير المفتاح الخاص من قاعدة البيانات لتصديره للمستخدم
+            decrypted_priv = db_protector.decrypt_private_key(row[0])
+            
+            # حزم المفاتيح للتصدير
+            export_data = json.dumps({"pr": decrypted_priv.decode(), "pb": row[1].decode()}).encode()
+            bio = io.BytesIO(export_data)
+            bio.name = "Sovereign_Identity.ghost"
+            
+            await c.send_document(
+                q.message.chat.id, 
+                bio, 
+                caption="⚠️ **ملف الهوية السيادية الخاص بك.**\nاحتفظ به في مكان آمن، من يملك هذا الملف يملك بياناتك."
+            )
+            logger.info(f"User {q.from_user.id} exported their identity.")
+        except Exception as e:
+            await q.answer("❌ حدث خطأ أثناء فك تشفير المفتاح للتصدير.", show_alert=True)
+
+@app.on_message(filters.document & filters.user(GlobalConfig.OWNER_ID))
+async def on_file_receive(c, m):
+    # استيراد الهوية
+    if m.document.file_name.endswith(".ghost"):
+        raw = (await m.download(in_memory=True)).getvalue()
+        data = json.loads(raw.decode())
+        
+        # تشفير المفتاح الخاص المستورد قبل حفظه في قاعدة البيانات
+        encrypted_imported_priv = db_protector.encrypt_private_key(data['pr'].encode())
+        
+        with sqlite3.connect(GlobalConfig.DB_NAME) as conn:
+            conn.execute("INSERT OR REPLACE INTO security_core VALUES (?, ?, ?)", 
+                         (m.from_user.id, encrypted_imported_priv, data['pb'].encode()))
+                         
+        logger.info(f"User {m.from_user.id} imported a new identity.")
+        return await m.reply_text("✅ **تم استيراد الهوية، وتشفيرها، وتفعيلها بنجاح داخل النظام.**")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 تشفير كلي (Headless)", callback_data=f"proc_enc|{m.id}")],
+        [InlineKeyboardButton("🖼️ تعمية داخل صورة (APK)", callback_data=f"proc_stg|{m.id}")],
+        [InlineKeyboardButton("🔓 فك التشفير واستعادة الأصل", callback_data=f"proc_dec|{m.id}")]
+    ])
+    await m.reply_text(
+        f"📦 **مستند مستلم:** `{m.document.file_name}`\n"
+        f"⚖️ **الحجم:** {m.document.file_size / (1024*1024):.2f} MB\n"
+        "اختر البروتوكول المطلوب:",
+        reply_markup=kb
+    )
+
+@app.on_callback_query(filters.regex("^proc_") & filters.user(GlobalConfig.OWNER_ID))
+async def start_process(c, q):
+    op, msg_id = q.data.split("|")
+    
+    with sqlite3.connect(GlobalConfig.DB_NAME) as conn:
+        identity_row = conn.execute("SELECT priv, pub FROM security_core WHERE uid=?", (q.from_user.id,)).fetchone()
+    
+    if not identity_row: 
+        return await q.answer("❌ يجب توليد هوية RSA من قائمة إدارة الهوية أولاً!", show_alert=True)
+
+    status = await q.message.edit_text("⏳ **جاري العمل في البيئة المعزولة... (استخراج وتجهيز المفاتيح)**")
+    
+    try:
+        # فك تشفير المفتاح الخاص المشفر في قاعدة البيانات للاستخدام الحالي
+        active_priv_key = db_protector.decrypt_private_key(identity_row[0])
+        active_pub_key = identity_row[1]
+        
+        target = await c.get_messages(q.message.chat.id, int(msg_id))
+        
+        await status.edit_text("📥 **جاري سحب البيانات إلى الذاكرة العشوائية...**")
+        raw_bytes = (await target.download(in_memory=True)).getvalue()
+        
+        orig_name = target.document.file_name if target.document else "unknown.bin"
+        ext = f".{orig_name.split('.')[-1]}" if "." in orig_name else ".bin"
+
+        start_time = time.time()
+        await status.edit_text("⚙️ **جاري تطبيق خوارزميات التشفير / المعالجة...**")
+        
+        if op == "proc_enc":
+            result = GhostEngineX.encrypt_atomic(raw_bytes, active_pub_key, ext)
+            final_name = "SECURE_VAULT.enc"
+            
+        elif op == "proc_stg":
+            encrypted_data = GhostEngineX.encrypt_atomic(raw_bytes, active_pub_key, ext)
+            result = GhostEngineX.stego_hide(encrypted_data)
+            final_name = "GHOST_RESERVE.png"
+            
+        elif op == "proc_dec":
+            try:
+                # محاولة فك التعمية أولاً (في حال كانت صورة)
+                extracted_data = GhostEngineX.stego_reveal(raw_bytes)
+                result, recovered_ext = GhostEngineX.decrypt_atomic(extracted_data, active_priv_key)
+            except Exception:
+                # محاولة فك التشفير المباشر
+                result, recovered_ext = GhostEngineX.decrypt_atomic(raw_bytes, active_priv_key)
+            final_name = f"RESTORED_{int(time.time())}{recovered_ext}"
+
+        final_io = io.BytesIO(result)
+        final_io.name = final_name
+        
+        await status.edit_text("📤 **جاري رفع الملف المعالج إلى الخوادم...**")
+        await c.send_document(
+            q.message.chat.id, 
+            final_io, 
+            caption=f"✅ **اكتملت العملية بنجاح.**\n⏱️ الوقت المستغرق: {time.time()-start_time:.2f} ثانية"
+        )
+        await status.delete()
+        logger.info(f"Operation {op} completed successfully for user {q.from_user.id}.")
+
+    except Exception as e:
+        logger.error(f"Process failed: {e}")
+        await status.edit_text(f"🚨 **فشل النظام في معالجة الملف:**\n`{str(e)}`")
+
+if __name__ == "__main__":
+    logger.info("Starting Iron Vault DB setup...")
+    db_setup()
+    logger.info(f"--- IRON VAULT v{GlobalConfig.VERSION} STARTED ---")
+    app.run()
