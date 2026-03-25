@@ -1,0 +1,318 @@
+import os
+import asyncio
+import logging
+import json
+import io
+import secrets
+import sys
+import time
+import tempfile
+from pathlib import Path
+from dotenv import load_dotenv
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    handlers=[
+        logging.FileHandler("iron_vault.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("IronVault")
+
+load_dotenv()
+
+try:
+    from pyrogram import Client, filters
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from PIL import Image
+    import aiosqlite
+    Image.MAX_IMAGE_PIXELS = None
+except ImportError as e:
+    logger.critical(e)
+    sys.exit(1)
+
+class GlobalConfig:
+    try:
+        API_ID = int(os.getenv("API_ID", 0))
+        API_HASH = os.getenv("API_HASH")
+        BOT_TOKEN = os.getenv("BOT_TOKEN")
+        OWNER_ID = int(os.getenv("OWNER_ID", 0))
+        DB_MASTER_KEY = os.getenv("DB_MASTER_KEY")
+        
+        if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID, DB_MASTER_KEY]):
+            raise ValueError()
+    except (TypeError, ValueError):
+        logger.critical("CRITICAL_ENV_ERROR")
+        sys.exit(1)
+    
+    DB_NAME = "iron_vault_ultimate.db"
+    SESSION_NAME = "IronVault_Sovereign"
+    VERSION = "14.0-PROD-SECURE"
+    START_TIME = time.time()
+    TEMP_DIR = Path(tempfile.gettempdir()) / "iron_vault"
+    TEMP_DIR.mkdir(exist_ok=True)
+
+class DatabaseManager:
+    @staticmethod
+    async def init_db():
+        async with aiosqlite.connect(GlobalConfig.DB_NAME) as db:
+            await db.execute("CREATE TABLE IF NOT EXISTS security_core (uid INTEGER PRIMARY KEY, priv BLOB, pub BLOB)")
+            await db.commit()
+
+    @staticmethod
+    async def get_keys(uid: int):
+        async with aiosqlite.connect(GlobalConfig.DB_NAME) as db:
+            async with db.execute("SELECT priv, pub FROM security_core WHERE uid=?", (uid,)) as cursor:
+                return await cursor.fetchone()
+
+    @staticmethod
+    async def save_keys(uid: int, priv: bytes, pub: bytes):
+        async with aiosqlite.connect(GlobalConfig.DB_NAME) as db:
+            await db.execute("INSERT OR REPLACE INTO security_core VALUES (?, ?, ?)", (uid, priv, pub))
+            await db.commit()
+
+class VaultProtector:
+    def __init__(self, master_password: str):
+        self.salt = b"IRON_VAULT_STATIC_SALT_FOR_DB_KEY_DERIVATION"
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.salt,
+            iterations=600000,
+        )
+        self.db_key = kdf.derive(master_password.encode('utf-8'))
+        self.aesgcm = AESGCM(self.db_key)
+
+    def encrypt_private_key(self, private_key_pem: bytes) -> bytes:
+        nonce = secrets.token_bytes(12)
+        ciphertext = self.aesgcm.encrypt(nonce, private_key_pem, None)
+        return nonce + ciphertext
+
+    def decrypt_private_key(self, encrypted_data: bytes) -> bytes:
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        return self.aesgcm.decrypt(nonce, ciphertext, None)
+
+db_protector = VaultProtector(GlobalConfig.DB_MASTER_KEY)
+
+class GhostEngineX:
+    @staticmethod
+    def encrypt_atomic(data: bytes, pub_key_pem: bytes, extension: str) -> bytes:
+        ext_bytes = extension.encode('utf-8')
+        ext_len = len(ext_bytes).to_bytes(1, 'big')
+        payload = ext_len + ext_bytes + data
+        
+        k1, k2 = secrets.token_bytes(32), secrets.token_bytes(32)
+        n1, n2 = secrets.token_bytes(12), secrets.token_bytes(12)
+
+        c1 = AESGCM(k1).encrypt(n1, payload, None)
+        c2 = ChaCha20Poly1305(k2).encrypt(n2, c1, None)
+
+        pub_key = serialization.load_pem_public_key(pub_key_pem)
+        wrapped = pub_key.encrypt(
+            k1 + k2,
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA512()), algorithm=hashes.SHA512(), label=None)
+        )
+        return len(wrapped).to_bytes(4, 'big') + wrapped + n1 + n2 + c2
+
+    @staticmethod
+    def decrypt_atomic(blob: bytes, priv_key_pem: bytes):
+        k_len = int.from_bytes(blob[:4], 'big')
+        wrapped = blob[4:4+k_len]
+        n1 = blob[4+k_len:16+k_len]
+        n2 = blob[16+k_len:28+k_len]
+        cipher = blob[28+k_len:]
+
+        priv_key = serialization.load_pem_private_key(priv_key_pem, password=None)
+        keys = priv_key.decrypt(wrapped, padding.OAEP(mgf=padding.MGF1(hashes.SHA512()), algorithm=hashes.SHA512(), label=None))
+        
+        k1, k2 = keys[:32], keys[32:]
+        decrypted_payload = AESGCM(k1).decrypt(n1, ChaCha20Poly1305(k2).decrypt(n2, cipher, None), None)
+        
+        e_len = decrypted_payload[0]
+        ext = decrypted_payload[1:1+e_len].decode('utf-8')
+        original_data = decrypted_payload[1+e_len:]
+        return original_data, ext
+
+    @staticmethod
+    def stego_hide(data: bytes, output_path: str):
+        payload = len(data).to_bytes(8, 'big') + data
+        total_pixels = (len(payload) // 3) + 1
+        width = 4096 
+        height = (total_pixels // width) + 1
+        
+        img = Image.new('RGB', (width, height))
+        padding_size = (width * height * 3) - len(payload)
+        img.frombytes(payload + b'\x00' * padding_size)
+        img.save(output_path, format="PNG", compress_level=0)
+
+    @staticmethod
+    def stego_reveal(img_path: str) -> bytes:
+        img = Image.open(img_path)
+        raw = img.tobytes()
+        size = int.from_bytes(raw[:8], 'big')
+        return raw[8:8+size]
+
+app = Client(
+    GlobalConfig.SESSION_NAME, 
+    api_id=GlobalConfig.API_ID, 
+    api_hash=GlobalConfig.API_HASH, 
+    bot_token=GlobalConfig.BOT_TOKEN
+)
+
+@app.on_message(filters.command("start") & filters.user(GlobalConfig.OWNER_ID))
+async def main_menu(c, m):
+    kb = ReplyKeyboardMarkup([
+        ["🔑 إدارة الهوية", "🛡️ حالة النظام"]
+    ], resize_keyboard=True)
+    await m.reply_text(
+        f"🛡️ **نظام IRON VAULT v{GlobalConfig.VERSION}**\n\nالسيرفر نشط ومؤمن.",
+        reply_markup=kb
+    )
+
+@app.on_message(filters.regex("🛡️ حالة النظام") & filters.user(GlobalConfig.OWNER_ID))
+async def system_status(c, m):
+    uptime = int(time.time() - GlobalConfig.START_TIME)
+    db_size = os.path.getsize(GlobalConfig.DB_NAME) / 1024 if os.path.exists(GlobalConfig.DB_NAME) else 0
+    row = await DatabaseManager.get_keys(m.from_user.id)
+    key_status = "✅ مشفرة ومؤمنة" if row else "❌ غير متوفرة"
+    
+    msg = (
+        f"📊 **حالة النظام:**\n"
+        f"⏱️ **التشغيل:** `{uptime}s`\n"
+        f"💾 **قاعدة البيانات:** `{db_size:.2f} KB`\n"
+        f"🔐 **الهوية:** {key_status}"
+    )
+    await m.reply_text(msg)
+
+@app.on_message(filters.regex("🔑 إدارة الهوية") & filters.user(GlobalConfig.OWNER_ID))
+async def identity_manager(c, m):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 توليد RSA-4096", callback_data="id_generate")],
+        [InlineKeyboardButton("📤 تصدير الهوية", callback_data="id_export")]
+    ])
+    await m.reply_text("🌐 **لوحة التحكم:**", reply_markup=kb)
+
+@app.on_callback_query(filters.regex("^id_") & filters.user(GlobalConfig.OWNER_ID))
+async def handle_identity(c, q):
+    action = q.data.split("_")[1]
+    
+    if action == "generate":
+        await q.answer("⏳ جاري التوليد...", show_alert=False)
+        key = rsa.generate_private_key(65537, 4096)
+        raw_priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        pub = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        
+        encrypted_priv = db_protector.encrypt_private_key(raw_priv)
+        await DatabaseManager.save_keys(q.from_user.id, encrypted_priv, pub)
+        await q.edit_message_text("✅ **تم توليد وتشفير المفاتيح بنجاح.**")
+    
+    elif action == "export":
+        row = await DatabaseManager.get_keys(q.from_user.id)
+        if not row: 
+            return await q.answer("❌ لا تملك هوية!", show_alert=True)
+            
+        try:
+            decrypted_priv = db_protector.decrypt_private_key(row[0])
+            export_data = json.dumps({"pr": decrypted_priv.decode(), "pb": row[1].decode()}).encode()
+            bio = io.BytesIO(export_data)
+            bio.name = "Sovereign_Identity.ghost"
+            
+            await c.send_document(q.message.chat.id, bio, caption="⚠️ **احتفظ به بأمان.**")
+            await q.answer("تم التصدير.")
+        except Exception:
+            await q.answer("❌ فشل التصدير.", show_alert=True)
+
+@app.on_message(filters.document & filters.user(GlobalConfig.OWNER_ID))
+async def on_file_receive(c, m):
+    if m.document.file_name.endswith(".ghost"):
+        file_path = await m.download(file_name=str(GlobalConfig.TEMP_DIR / f"{m.id}_import.ghost"))
+        try:
+            with open(file_path, 'r') as f:
+                data = json.loads(f.read())
+            encrypted_imported_priv = db_protector.encrypt_private_key(data['pr'].encode())
+            await DatabaseManager.save_keys(m.from_user.id, encrypted_imported_priv, data['pb'].encode())
+            return await m.reply_text("✅ **تم استيراد الهوية بنجاح.**")
+        finally:
+            if os.path.exists(file_path): os.remove(file_path)
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 تشفير (AES+ChaCha20+RSA)", callback_data=f"op_enc_{m.id}")],
+        [InlineKeyboardButton("🖼️ إخفاء صوري (Stego)", callback_data=f"op_stg_{m.id}")],
+        [InlineKeyboardButton("🔓 فك التشفير", callback_data=f"op_dec_{m.id}")]
+    ])
+    await m.reply_text(f"📦 `{m.document.file_name}`\nاختر العملية:", reply_markup=kb)
+
+@app.on_callback_query(filters.regex("^op_") & filters.user(GlobalConfig.OWNER_ID))
+async def start_process(c, q):
+    _, op, msg_id = q.data.split("_")
+    
+    identity_row = await DatabaseManager.get_keys(q.from_user.id)
+    if not identity_row: 
+        return await q.answer("❌ يرجى توليد الهوية أولاً!", show_alert=True)
+
+    status = await q.message.edit_text("⏳ **جاري المعالجة...**")
+    target = await c.get_messages(q.message.chat.id, int(msg_id))
+    
+    temp_input = str(GlobalConfig.TEMP_DIR / f"{msg_id}_in.tmp")
+    temp_output = str(GlobalConfig.TEMP_DIR / f"{msg_id}_out.tmp")
+    
+    try:
+        active_priv_key = db_protector.decrypt_private_key(identity_row[0])
+        active_pub_key = identity_row[1]
+        
+        await target.download(file_name=temp_input)
+        
+        orig_name = target.document.file_name if target.document else "unknown.bin"
+        ext = f".{orig_name.split('.')[-1]}" if "." in orig_name else ".bin"
+        start_time = time.time()
+
+        with open(temp_input, 'rb') as f:
+            raw_bytes = f.read()
+
+        if op == "enc":
+            result = GhostEngineX.encrypt_atomic(raw_bytes, active_pub_key, ext)
+            with open(temp_output, 'wb') as f: f.write(result)
+            final_name = "SECURE_VAULT.enc"
+            
+        elif op == "stg":
+            encrypted_data = GhostEngineX.encrypt_atomic(raw_bytes, active_pub_key, ext)
+            GhostEngineX.stego_hide(encrypted_data, temp_output)
+            final_name = "GHOST_RESERVE.png"
+            
+        elif op == "dec":
+            try:
+                extracted_data = GhostEngineX.stego_reveal(temp_input)
+                result, recovered_ext = GhostEngineX.decrypt_atomic(extracted_data, active_priv_key)
+            except Exception:
+                result, recovered_ext = GhostEngineX.decrypt_atomic(raw_bytes, active_priv_key)
+            
+            with open(temp_output, 'wb') as f: f.write(result)
+            final_name = f"RESTORED_{int(time.time())}{recovered_ext}"
+
+        await status.edit_text("📤 **جاري الرفع...**")
+        await c.send_document(q.message.chat.id, document=temp_output, file_name=final_name, caption=f"✅ **اكتملت في {time.time()-start_time:.2f}s**")
+        await status.delete()
+
+    except Exception as e:
+        logger.error(f"Process failed: {e}")
+        await status.edit_text(f"🚨 **فشل:**\n`{str(e)}`")
+    finally:
+        if os.path.exists(temp_input): os.remove(temp_input)
+        if os.path.exists(temp_output): os.remove(temp_output)
+
+async def main():
+    await DatabaseManager.init_db()
+    await app.start()
+    logger.info(f"--- IRON VAULT v{GlobalConfig.VERSION} RUNNING ---")
+    await pyrogram.idle()
+
+if __name__ == "__main__":
+    import pyrogram
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
